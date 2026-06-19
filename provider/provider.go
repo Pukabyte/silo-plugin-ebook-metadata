@@ -3,8 +3,8 @@ package provider
 import (
 	"context"
 	"log"
+	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Silo-Server/silo-plugin-ebook-metadata/metadata"
@@ -12,7 +12,18 @@ import (
 
 const (
 	providerTimeout = 10 * time.Second
-	searchWorkers   = 4
+	// perSourceTimeout bounds one source within the sequential chain so a slow
+	// source (e.g. a multi-fetch one) cannot starve the rest of the chain.
+	perSourceTimeout = 6 * time.Second
+	// chainTimeout is the overall budget for a Search across all chained sources.
+	chainTimeout = 25 * time.Second
+	// relevanceFloor is the minimum query-coverage score for a match to be kept;
+	// it discards loose keyword hits (e.g. Gutenberg/Internet Archive returning
+	// unrelated public-domain books or magazines for a title).
+	relevanceFloor = 0.6
+	// confidentScore is the coverage at which a covered match is trusted enough
+	// to stop the chain, so later (rate-limited) sources are never queried.
+	confidentScore = 0.85
 )
 
 type Source interface {
@@ -63,57 +74,69 @@ func NewProviderWithSources(sources []Source) *Provider {
 	return p
 }
 
+// scoredMatch pairs a match with its query-coverage relevance score.
+type scoredMatch struct {
+	match metadata.Match
+	score float64
+}
+
+// Search runs the sources as a relevance-ranked chain rather than a fanout.
+// Sources are queried in priority order (cheap/unlimited first, rate-limited
+// last); each match is scored for query coverage and only sufficiently relevant
+// matches are kept. As soon as a source yields a confident, covered match the
+// chain stops, so later sources — especially rate-limited ones like Hardcover —
+// are queried only when earlier ones fall short. Results are returned best-first
+// so the host's top-result consumer gets the correct book, not a loose hit that
+// merely finished first.
 func (p *Provider) Search(ctx context.Context, q metadata.SearchQuery) ([]metadata.Match, error) {
-	tctx, cancel := context.WithTimeout(ctx, providerTimeout)
+	cctx, cancel := context.WithTimeout(ctx, chainTimeout)
 	defer cancel()
 
-	type result struct {
-		source  string
-		matches []metadata.Match
-		err     error
-	}
-
-	results := make(chan result, len(p.sources))
-	sem := make(chan struct{}, searchWorkers)
-
-	var wg sync.WaitGroup
+	var collected []scoredMatch
 	for _, source := range p.sources {
-		wg.Add(1)
-		go func(source Source) {
-			defer wg.Done()
-
-			select {
-			case sem <- struct{}{}:
-			case <-tctx.Done():
-				results <- result{source: strings.TrimSpace(source.ID()), err: tctx.Err()}
-				return
-			}
-			defer func() { <-sem }()
-
-			matches, err := source.Search(tctx, q)
-			results <- result{
-				source:  strings.TrimSpace(source.ID()),
-				matches: matches,
-				err:     err,
-			}
-		}(source)
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var matches []metadata.Match
-	for result := range results {
-		if result.err != nil {
-			log.Printf("ebook-metadata: provider %s search error: %v", result.source, result.err)
+		if cctx.Err() != nil {
+			break
+		}
+		sctx, scancel := context.WithTimeout(cctx, perSourceTimeout)
+		matches, err := source.Search(sctx, q)
+		scancel()
+		if err != nil {
+			log.Printf("ebook-metadata: provider %s search error: %v", strings.TrimSpace(source.ID()), err)
 			continue
 		}
-		matches = append(matches, result.matches...)
+
+		confidentCovered := false
+		for _, m := range matches {
+			score := relevanceScore(q, m)
+			if score < relevanceFloor {
+				continue
+			}
+			collected = append(collected, scoredMatch{match: m, score: score})
+			if score >= confidentScore && strings.TrimSpace(m.CoverURL) != "" {
+				confidentCovered = true
+			}
+		}
+		// A confident covered match ends the chain: later sources cannot improve
+		// on it and need not spend their (possibly rate-limited) budget.
+		if confidentCovered {
+			break
+		}
 	}
 
-	return matches, nil
+	sort.SliceStable(collected, func(i, j int) bool {
+		if collected[i].score != collected[j].score {
+			return collected[i].score > collected[j].score
+		}
+		ci := strings.TrimSpace(collected[i].match.CoverURL) != ""
+		cj := strings.TrimSpace(collected[j].match.CoverURL) != ""
+		return ci && !cj
+	})
+
+	out := make([]metadata.Match, len(collected))
+	for i := range collected {
+		out[i] = collected[i].match
+	}
+	return out, nil
 }
 
 func (p *Provider) Fetch(ctx context.Context, q metadata.SearchQuery) (*metadata.Match, error) {
@@ -214,20 +237,30 @@ func (p *Provider) backfillCover(ctx context.Context, match *metadata.Match, q m
 
 func defaultSources(options Options) []Source {
 	userAgent := "silo-plugin-ebook-metadata/0.1"
+	// Ordered fast structured-API sources first, fragile HTML scrapers last.
+	// Search fans out concurrently and ranks the aggregate, but this order
+	// gives the fast, high-hit-rate APIs first claim on worker slots and keeps
+	// the slow scrapers (which only matter for the long-tail) from starving
+	// them. Fetch's ISBN fallback and cover backfill rely on the fast tier too.
+	// Chain order: cheap/unlimited and high-precision sources first so the chain
+	// usually stops early; rate-limited or quota-bound sources (Google Books,
+	// Hardcover) sit last so they are only queried when earlier sources miss,
+	// preserving their request budgets. Disabled-by-default scrapers trail.
 	sources := []Source{
 		NewOpenLibraryClient(userAgent),
-		NewGoogleBooksClient(options.GoogleBooksAPIKey, userAgent),
-		NewISBNdbClient(options.ISBNdbAPIKey, userAgent),
-		NewHardcoverClient(options.HardcoverAPIKey, userAgent),
-		NewGoodreadsClient(userAgent),
-		NewAmazonClient(userAgent),
-		NewAnnasArchiveClient(userAgent),
-		NewGutenbergClient(userAgent),
-		NewBookBrainzClient(userAgent),
-		NewFantasticFictionClient(userAgent),
-		NewISFDBClient(userAgent),
-		NewLibraryThingClient(userAgent),
+		NewBookInfoClient(userAgent),
 		NewInternetArchiveClient(userAgent),
+		NewGutenbergClient(userAgent),
+		NewGoogleBooksClient(options.GoogleBooksAPIKey, userAgent),
+		NewHardcoverClient(options.HardcoverAPIKey, userAgent),
+		NewISBNdbClient(options.ISBNdbAPIKey, userAgent),
+		NewBookBrainzClient(userAgent),
+		NewGoodreadsClient(userAgent),
+		NewLibraryThingClient(userAgent),
+		NewISFDBClient(userAgent),
+		NewFantasticFictionClient(userAgent),
+		NewAnnasArchiveClient(userAgent),
+		NewAmazonClient(userAgent),
 		NewWorldCatClient(userAgent),
 		NewDoubanClient(userAgent),
 	}
