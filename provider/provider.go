@@ -120,24 +120,41 @@ func (p *Provider) Fetch(ctx context.Context, q metadata.SearchQuery) (*metadata
 	tctx, cancel := context.WithTimeout(ctx, providerTimeout)
 	defer cancel()
 
+	match, backfill, err := p.fetchPrimary(tctx, q)
+	// Backfill only on the ISBN-fallback path: an explicit source-specific or
+	// capability ID pins a single source and must not fan out to others.
+	if match != nil && backfill {
+		p.backfillCover(tctx, match, q)
+	}
+	return match, err
+}
+
+// fetchPrimary resolves the best metadata match using provider-specific IDs,
+// then the capability ID, then ISBN. It returns the first source that responds
+// regardless of whether that match carries a cover. The bool reports whether
+// the match came from the ISBN fallback (i.e. no explicit source pin), in which
+// case the caller may backfill a missing cover from other sources.
+func (p *Provider) fetchPrimary(tctx context.Context, q metadata.SearchQuery) (*metadata.Match, bool, error) {
 	for _, source := range p.sources {
 		sourceID := strings.TrimSpace(source.ID())
 		providerID := strings.TrimSpace(q.ProviderIDs[sourceID])
 		if sourceID == "" || providerID == "" {
 			continue
 		}
-		return source.Fetch(tctx, providerID)
+		match, err := source.Fetch(tctx, providerID)
+		return match, false, err
 	}
 
 	if sourceID, providerID := metadata.ParseCapabilityProviderID(q.ProviderIDs[metadata.CapabilityID]); sourceID != "" {
 		if source := p.byID[sourceID]; source != nil {
-			return source.Fetch(tctx, providerID)
+			match, err := source.Fetch(tctx, providerID)
+			return match, false, err
 		}
 	}
 
 	isbn := metadata.NormalizeISBN(q.ProviderIDs["isbn"])
 	if isbn == "" {
-		return nil, nil
+		return nil, false, nil
 	}
 	var lastErr error
 	for _, sourceID := range []string{"openlibrary", "googlebooks", "isbndb"} {
@@ -147,14 +164,52 @@ func (p *Provider) Fetch(ctx context.Context, q metadata.SearchQuery) (*metadata
 		}
 		match, err := source.Fetch(tctx, isbn)
 		if match != nil {
-			return match, nil
+			return match, true, nil
 		}
 		if err != nil {
 			lastErr = err
 		}
 	}
 
-	return nil, lastErr
+	return nil, false, lastErr
+}
+
+// backfillCover fills a missing cover from other ISBN-capable sources. The
+// primary match often has full text metadata but no cover image (e.g. an
+// OpenLibrary record with no cover), and the host has no GetImages fallback for
+// this plugin, so the cover must travel on the match itself. We graft a cover
+// from the first source that has one for this ISBN.
+//
+// ponytail: sequential extra fetches, only when the primary match has no
+// cover; parallelize if this becomes a latency hotspot.
+func (p *Provider) backfillCover(ctx context.Context, match *metadata.Match, q metadata.SearchQuery) {
+	if match == nil || strings.TrimSpace(match.CoverURL) != "" {
+		return
+	}
+	isbn := metadata.NormalizeISBN(q.ProviderIDs["isbn"])
+	if isbn == "" {
+		isbn = metadata.NormalizeISBN(match.ISBN)
+	}
+	if isbn == "" {
+		return
+	}
+	for _, sourceID := range []string{"googlebooks", "openlibrary", "isbndb"} {
+		if sourceID == match.Provider {
+			continue // already produced this match and gave no cover
+		}
+		source := p.byID[sourceID]
+		if source == nil {
+			continue
+		}
+		alt, err := source.Fetch(ctx, isbn)
+		if err != nil || alt == nil {
+			continue
+		}
+		if cover := strings.TrimSpace(alt.CoverURL); cover != "" {
+			match.CoverURL = cover
+			return
+		}
+	}
 }
 
 func defaultSources(options Options) []Source {
